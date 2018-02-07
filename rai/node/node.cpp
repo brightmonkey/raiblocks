@@ -163,16 +163,19 @@ bool confirm_block (MDB_txn * transaction_a, rai::node & node_a, T & list_a, std
 	{
 		node_a.wallets.foreach_representative (transaction_a, [&result, &block_a, &list_a, &node_a, &transaction_a](rai::public_key const & pub_a, rai::raw_key const & prv_a) {
 			result = true;
-			auto vote (node_a.store.vote_generate (transaction_a, pub_a, prv_a, block_a));
-			rai::confirm_ack confirm (vote);
-			std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
+			auto votes (node_a.store.vote_generate (transaction_a, pub_a, prv_a, block_a));
+			for (auto vote : { votes.first, votes.second })
 			{
-				rai::vectorstream stream (*bytes);
-				confirm.serialize (stream);
-			}
-			for (auto j (list_a.begin ()), m (list_a.end ()); j != m; ++j)
-			{
-				node_a.network.confirm_send (confirm, bytes, *j);
+				rai::confirm_ack confirm (vote);
+				std::shared_ptr<std::vector<uint8_t>> bytes (new std::vector<uint8_t>);
+				{
+					rai::vectorstream stream (*bytes);
+					confirm.serialize (stream);
+				}
+				for (auto j (list_a.begin ()), m (list_a.end ()); j != m; ++j)
+				{
+					node_a.network.confirm_send (confirm, bytes, *j);
+				}
 			}
 		});
 	}
@@ -190,7 +193,6 @@ bool confirm_block (MDB_txn * transaction_a, rai::node & node_a, rai::endpoint &
 
 void rai::network::republish_block (MDB_txn * transaction, std::shared_ptr<rai::block> block)
 {
-	rebroadcast_reps (block);
 	auto hash (block->hash ());
 	auto list (node.peers.list_sqrt ());
 	// If we're a representative, broadcast a signed confirm, otherwise an unsigned publish
@@ -1042,6 +1044,7 @@ rai::vote_result rai::vote_processor::vote (std::shared_ptr<rai::vote> vote_a, r
 				status = "Replay";
 				break;
 			case rai::vote_code::vote:
+			case rai::vote_code::vote2:
 				status = "Vote";
 				break;
 		}
@@ -1050,7 +1053,8 @@ rai::vote_result rai::vote_processor::vote (std::shared_ptr<rai::vote> vote_a, r
 	switch (result.code)
 	{
 		case rai::vote_code::vote:
-			node.observers.vote (vote_a, endpoint_a);
+		case rai::vote_code::vote2:
+			node.observers.vote (vote_a, result.code, endpoint_a);
 		case rai::vote_code::replay:
 		case rai::vote_code::invalid:
 			break;
@@ -1166,17 +1170,22 @@ void rai::block_processor::process_receive_many (std::deque<rai::block_processor
 			{
 				auto item (blocks_processing.front ());
 				blocks_processing.pop_front ();
-				auto hash (item.block->hash ());
+				auto hash2_new (node.store.hash2_calc (transaction, *item.block));
 				if (item.force)
 				{
 					auto successor (node.ledger.successor (transaction, item.block->root ()));
-					if (successor != nullptr && successor->hash () != hash)
+					if (successor != nullptr)
 					{
-						// Replace our block with the winner and roll back any dependent blocks
-						BOOST_LOG (node.log) << boost::str (boost::format ("Rolling back %1% and replacing with %2%") % successor->hash ().to_string () % hash.to_string ());
-						node.ledger.rollback (transaction, successor->hash ());
+						auto hash2_existing (node.store.hash2_calc (transaction, *successor));
+						if (hash2_new != hash2_existing)
+						{
+							// Replace our block with the winner and roll back any dependent blocks
+							BOOST_LOG (node.log) << boost::str (boost::format ("Rolling back %1% and replacing with %2%") % hash2_existing.to_string () % hash2_new.to_string ());
+							node.ledger.rollback (transaction, successor->hash ());
+						}
 					}
 				}
+				auto hash (item.block->hash ());
 				auto process_result (process_receive_one (transaction, item.block));
 				switch (process_result.code)
 				{
@@ -1285,11 +1294,11 @@ rai::process_return rai::block_processor::process_receive_one (MDB_txn * transac
 			}
 			break;
 		}
-		case rai::process_result::overspend:
+		case rai::process_result::negative_spend:
 		{
 			if (node.config.logging.ledger_logging ())
 			{
-				BOOST_LOG (node.log) << boost::str (boost::format ("Overspend for: %1%") % block_a->hash ().to_string ());
+				BOOST_LOG (node.log) << boost::str (boost::format ("Negative spend for: %1%") % block_a->hash ().to_string ());
 			}
 			break;
 		}
@@ -1479,13 +1488,17 @@ block_processor_thread ([this]() { this->block_processor.process_blocks (); })
 		this->network.send_keepalive (endpoint_a);
 		rep_query (*this, endpoint_a);
 	});
-	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::endpoint const &) {
-		active.vote (vote_a);
+	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::vote_code code, rai::endpoint const & endpoint_a) {
+		assert (code == rai::vote_code::vote || code == rai::vote_code::vote2);
+		if (!peers.hash2_aware (endpoint_a) || code == rai::vote_code::vote2)
+		{
+			active.vote (vote_a);
+		}
 	});
-	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::endpoint const &) {
+	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::vote_code, rai::endpoint const &) {
 		this->gap_cache.vote (vote_a);
 	});
-	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::endpoint const & endpoint_a) {
+	observers.vote.add ([this](std::shared_ptr<rai::vote> vote_a, rai::vote_code, rai::endpoint const & endpoint_a) {
 		if (this->rep_crawler.exists (vote_a->block->hash ()))
 		{
 			auto weight_l (weight (vote_a->account));
@@ -1789,6 +1802,10 @@ bool rai::parse_tcp_endpoint (std::string const & string, rai::tcp_endpoint & en
 
 void rai::node::start ()
 {
+	if (store_version () < 11)
+	{
+		store_update ();
+	}
 	network.receive ();
 	ongoing_keepalive ();
 	ongoing_bootstrap ();
@@ -1800,6 +1817,15 @@ void rai::node::start ()
 	port_mapping.start ();
 	add_initial_peers ();
 	observers.started ();
+}
+
+void rai::node::store_update ()
+{
+	if (store_version () < 11)
+	{
+		BOOST_LOG (log) << "Updating block store";
+		store.upgrade_v10_to_v11 ();
+	}
 }
 
 void rai::node::stop ()
@@ -2420,6 +2446,18 @@ bool rai::peer_container::empty ()
 	return size () == 0;
 }
 
+bool rai::peer_container::hash2_aware (rai::endpoint const & endpoint_a)
+{
+	std::lock_guard<std::mutex> lock (mutex);
+	auto result (false);
+	auto existing (peers.find (endpoint_a));
+	if (existing != peers.end ())
+	{
+		result = existing->network_version >= 0x6;
+	}
+	return result;
+}
+
 bool rai::peer_container::not_a_peer (rai::endpoint const & endpoint_a)
 {
 	bool result (false);
@@ -2676,7 +2714,7 @@ void rai::election::compute_rep_votes (MDB_txn * transaction_a)
 {
 	node.wallets.foreach_representative (transaction_a, [this, transaction_a](rai::public_key const & pub_a, rai::raw_key const & prv_a) {
 		auto vote (this->node.store.vote_generate (transaction_a, pub_a, prv_a, last_winner));
-		this->votes.vote (vote);
+		this->votes.vote (vote.second);
 	});
 }
 
@@ -2770,7 +2808,7 @@ void rai::election::vote (std::shared_ptr<rai::vote> vote_a)
 	node.network.republish_vote (last_vote, vote_a);
 	last_vote = std::chrono::steady_clock::now ();
 	rai::transaction transaction (node.store.environment, nullptr, true);
-	assert (node.store.vote_validate (transaction, vote_a).code != rai::vote_code::invalid);
+	//assert (node.store.vote_validate (transaction, vote_a).code != rai::vote_code::invalid);
 	votes.vote (vote_a);
 	confirm_if_quorum (transaction);
 }
@@ -2953,6 +2991,7 @@ void rai::add_node_options (boost::program_options::options_description & descri
 bool rai::handle_node_options (boost::program_options::variables_map & vm)
 {
 	auto result (false);
+	boost::filesystem::path data_path = vm.count ("data_path") ? boost::filesystem::path (vm["data_path"].as<std::string> ()) : rai::working_path ();
 	if (vm.count ("account_create"))
 	{
 		if (vm.count ("wallet") == 1)
@@ -2965,7 +3004,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 				{
 					password = vm["password"].as<std::string> ();
 				}
-				inactive_node node;
+				inactive_node node (data_path);
 				auto wallet (node.node->wallets.open (wallet_id));
 				if (wallet != nullptr)
 				{
@@ -3031,8 +3070,6 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 	{
 		try
 		{
-			boost::filesystem::path data_path = vm.count ("data_path") ? boost::filesystem::path (vm["data_path"].as<std::string> ()) : rai::working_path ();
-
 			auto vacuum_path = data_path / "vacuumed.ldb";
 			auto source_path = data_path / "data.ldb";
 			auto backup_path = data_path / "backup.vacuum.ldb";
@@ -3069,7 +3106,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 	}
 	else if (vm.count ("diagnostics"))
 	{
-		inactive_node node;
+		inactive_node node (data_path);
 		std::cout << "Testing hash function" << std::endl;
 		rai::raw_key key;
 		key.data.clear ();
@@ -3132,7 +3169,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 				{
 					password = vm["password"].as<std::string> ();
 				}
-				inactive_node node;
+				inactive_node node (data_path);
 				auto wallet (node.node->wallets.open (wallet_id));
 				if (wallet != nullptr)
 				{
@@ -3186,7 +3223,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 				{
 					password = vm["password"].as<std::string> ();
 				}
-				inactive_node node;
+				inactive_node node (data_path);
 				auto wallet (node.node->wallets.open (wallet_id));
 				if (wallet != nullptr)
 				{
@@ -3230,7 +3267,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 	}
 	else if (vm.count ("wallet_create"))
 	{
-		inactive_node node;
+		inactive_node node (data_path);
 		rai::keypair key;
 		std::cout << key.pub.to_string () << std::endl;
 		auto wallet (node.node->wallets.create (key.pub));
@@ -3248,7 +3285,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 			rai::uint256_union wallet_id;
 			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
 			{
-				inactive_node node;
+				inactive_node node (data_path);
 				auto existing (node.node->wallets.items.find (wallet_id));
 				if (existing != node.node->wallets.items.end ())
 				{
@@ -3298,7 +3335,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 			rai::uint256_union wallet_id;
 			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
 			{
-				inactive_node node;
+				inactive_node node (data_path);
 				if (node.node->wallets.items.find (wallet_id) != node.node->wallets.items.end ())
 				{
 					node.node->wallets.destroy (wallet_id);
@@ -3342,7 +3379,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 					rai::uint256_union wallet_id;
 					if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
 					{
-						inactive_node node;
+						inactive_node node (data_path);
 						auto existing (node.node->wallets.items.find (wallet_id));
 						if (existing != node.node->wallets.items.end ())
 						{
@@ -3388,7 +3425,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 	}
 	else if (vm.count ("wallet_list"))
 	{
-		inactive_node node;
+		inactive_node node (data_path);
 		for (auto i (node.node->wallets.items.begin ()), n (node.node->wallets.items.end ()); i != n; ++i)
 		{
 			std::cout << boost::str (boost::format ("Wallet ID: %1%\n") % i->first.to_string ());
@@ -3403,7 +3440,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 	{
 		if (vm.count ("wallet") == 1 && vm.count ("account") == 1)
 		{
-			inactive_node node;
+			inactive_node node (data_path);
 			rai::uint256_union wallet_id;
 			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
 			{
@@ -3456,7 +3493,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 			rai::uint256_union wallet_id;
 			if (!wallet_id.decode_hex (vm["wallet"].as<std::string> ()))
 			{
-				inactive_node node;
+				inactive_node node (data_path);
 				auto wallet (node.node->wallets.items.find (wallet_id));
 				if (wallet != node.node->wallets.items.end ())
 				{
@@ -3494,7 +3531,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 					rai::account account;
 					if (!account.decode_account (vm["account"].as<std::string> ()))
 					{
-						inactive_node node;
+						inactive_node node (data_path);
 						auto wallet (node.node->wallets.items.find (wallet_id));
 						if (wallet != node.node->wallets.items.end ())
 						{
@@ -3533,7 +3570,7 @@ bool rai::handle_node_options (boost::program_options::variables_map & vm)
 	}
 	else if (vm.count ("vote_dump") == 1)
 	{
-		inactive_node node;
+		inactive_node node (data_path);
 		rai::transaction transaction (node.node->store.environment, nullptr, false);
 		for (auto i (node.node->store.vote_begin (transaction)), n (node.node->store.vote_end ()); i != n; ++i)
 		{
