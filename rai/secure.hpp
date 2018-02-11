@@ -192,7 +192,7 @@ public:
 	void block_del (MDB_txn *, rai::block_hash const &);
 	bool block_exists (MDB_txn *, rai::block_hash const &);
 	rai::block_counts block_count (MDB_txn *);
-	std::unordered_multimap <rai::block_hash, rai::block_hash> block_dependencies (MDB_txn *);
+	std::unordered_multimap<rai::block_hash, rai::block_hash> block_dependencies (MDB_txn *);
 
 	void frontier_put (MDB_txn *, rai::block_hash const &, rai::account const &);
 	rai::account frontier_get (MDB_txn *, rai::block_hash const &);
@@ -390,6 +390,9 @@ public:
 	static rai::uint128_t const unit;
 	rai::block_store & store;
 	rai::uint128_t inactive_supply;
+	std::unordered_map<rai::account, rai::uint128_t> bootstrap_weights;
+	uint64_t bootstrap_weight_max_blocks;
+	std::atomic<bool> check_bootstrap_weights;
 };
 extern rai::keypair const & zero_key;
 extern rai::keypair const & test_genesis_key;

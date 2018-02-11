@@ -1320,7 +1320,11 @@ rai::process_return rai::block_processor::process_receive_one (MDB_txn * transac
 		}
 		case rai::process_result::fork:
 		{
-			node.bootstrap_initiator.process_fork (transaction_a, block_a);
+			if (!node.block_arrival.recent (block_a->hash ()))
+			{
+				// Only let the bootstrap attempt know about forked blocks that did not arrive via UDP.
+				node.bootstrap_initiator.process_fork (transaction_a, block_a);
+			}
 			if (node.config.logging.ledger_logging ())
 			{
 				BOOST_LOG (node.log) << boost::str (boost::format ("Fork for: %1% root: %2%") % block_a->hash ().to_string () % block_a->root ().to_string ());
@@ -1523,6 +1527,37 @@ block_processor_thread ([this]() { this->block_processor.process_blocks (); })
 			// Store was empty meaning we just created it, add the genesis block
 			rai::genesis genesis;
 			genesis.initialize (transaction, store);
+		}
+	}
+	if (rai::rai_network == rai::rai_networks::rai_live_network)
+	{
+		extern const char rai_bootstrap_weights[];
+		extern const size_t rai_bootstrap_weights_size;
+		rai::bufferstream weight_stream ((const uint8_t *)rai_bootstrap_weights, rai_bootstrap_weights_size);
+		rai::uint128_union block_height;
+		if (!rai::read (weight_stream, block_height))
+		{
+			auto max_blocks = (uint64_t)block_height.number ();
+			rai::transaction transaction (store.environment, nullptr, false);
+			if (ledger.store.block_count (transaction).sum () < max_blocks)
+			{
+				ledger.bootstrap_weight_max_blocks = max_blocks;
+				while (true)
+				{
+					rai::account account;
+					if (rai::read (weight_stream, account.bytes))
+					{
+						break;
+					}
+					rai::amount weight;
+					if (rai::read (weight_stream, weight.bytes))
+					{
+						break;
+					}
+					BOOST_LOG (log) << "Using bootstrap rep weight: " << account.to_account () << " -> " << weight.format_balance (Mxrb_ratio, 0, true) << " XRB";
+					ledger.bootstrap_weights[account] = weight.number ();
+				}
+			}
 		}
 	}
 }
@@ -2698,7 +2733,7 @@ std::shared_ptr<rai::node> rai::node::shared ()
 	return shared_from_this ();
 }
 
-rai::election::election (MDB_txn * transaction_a, rai::node & node_a, std::shared_ptr<rai::block> block_a, std::function<void(std::shared_ptr<rai::block>)> const & confirmation_action_a) :
+rai::election::election (MDB_txn * transaction_a, rai::node & node_a, std::shared_ptr<rai::block> block_a, std::function<void(std::shared_ptr<rai::block>, bool)> const & confirmation_action_a) :
 confirmation_action (confirmation_action_a),
 votes (block_a),
 node (node_a),
@@ -2748,9 +2783,10 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 		assert (tally_l.size () > 0);
 		auto winner (tally_l.begin ());
 		auto block_l (winner->second);
+		auto exceeded_min_threshold = winner->first > minimum_threshold (transaction_a, node.ledger);
 		if (!(*block_l == *last_winner))
 		{
-			if (winner->first > minimum_threshold (transaction_a, node.ledger))
+			if (exceeded_min_threshold)
 			{
 				auto node_l (node.shared ());
 				node.background ([node_l, block_l]() {
@@ -2766,9 +2802,9 @@ void rai::election::confirm_once (MDB_txn * transaction_a)
 		auto winner_l (last_winner);
 		auto node_l (node.shared ());
 		auto confirmation_action_l (confirmation_action);
-		node.background ([winner_l, confirmation_action_l, node_l]() {
+		node.background ([winner_l, confirmation_action_l, node_l, exceeded_min_threshold]() {
 			node_l->process_confirmed (winner_l);
-			confirmation_action_l (winner_l);
+			confirmation_action_l (winner_l, exceeded_min_threshold);
 		});
 	}
 }
@@ -2875,7 +2911,7 @@ void rai::active_transactions::stop ()
 	roots.clear ();
 }
 
-bool rai::active_transactions::start (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a, std::function<void(std::shared_ptr<rai::block>)> const & confirmation_action_a)
+bool rai::active_transactions::start (MDB_txn * transaction_a, std::shared_ptr<rai::block> block_a, std::function<void(std::shared_ptr<rai::block>, bool)> const & confirmation_action_a)
 {
 	std::lock_guard<std::mutex> lock (mutex);
 	auto root (block_a->root ());
