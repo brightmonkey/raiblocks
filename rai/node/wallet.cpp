@@ -1104,7 +1104,7 @@ public:
 					rai::account_info info;
 					auto error (wallet->node.store.account_get (transaction, pending.source, info));
 					assert (!error);
-					BOOST_LOG (wallet->node.log) << boost::str (boost::format ("Found a pending block %1% from account %2% with head %3%") % pending.source.to_string () % pending.source.to_account () % info.head.to_string ());
+					BOOST_LOG (wallet->node.log) << boost::str (boost::format ("Found a pending block %1% from account %2% with head %3%") % key.hash.to_string () % pending.source.to_account () % info.head.to_string ());
 					auto account (pending.source);
 					if (already_searched.find (account) == already_searched.end ())
 					{
@@ -1112,7 +1112,7 @@ public:
 						std::shared_ptr<rai::block> block_l (wallet->node.store.block_get (transaction, info.head));
 						wallet->node.background ([this_l, account, block_l] {
 							rai::transaction transaction (this_l->wallet->node.store.environment, nullptr, true);
-							this_l->wallet->node.active.start (transaction, block_l, [this_l, account](std::shared_ptr<rai::block>) {
+							this_l->wallet->node.active.start (transaction, block_l, [this_l, account](std::shared_ptr<rai::block>, bool) {
 								// If there were any forks for this account they've been rolled back and we can receive anything remaining from this account
 								this_l->receive_all (account);
 							});
@@ -1123,7 +1123,7 @@ public:
 				}
 				else
 				{
-					BOOST_LOG (wallet->node.log) << boost::str (boost::format ("Not receiving block %1% due to minimum receive threshold") % pending.source.to_string ());
+					BOOST_LOG (wallet->node.log) << boost::str (boost::format ("Not receiving block %1% due to minimum receive threshold") % key.hash.to_string ());
 				}
 			}
 		}

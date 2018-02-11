@@ -37,11 +37,11 @@ namespace rai
 class node;
 class election : public std::enable_shared_from_this<rai::election>
 {
-	std::function<void(std::shared_ptr<rai::block>)> confirmation_action;
+	std::function<void(std::shared_ptr<rai::block>, bool)> confirmation_action;
 	void confirm_once (MDB_txn *);
 
 public:
-	election (MDB_txn *, rai::node &, std::shared_ptr<rai::block>, std::function<void(std::shared_ptr<rai::block>)> const &);
+	election (MDB_txn *, rai::node &, std::shared_ptr<rai::block>, std::function<void(std::shared_ptr<rai::block>, bool)> const &);
 	void vote (std::shared_ptr<rai::vote>);
 	// Check if we have vote quorum
 	bool have_quorum (MDB_txn *);
@@ -77,7 +77,7 @@ public:
 	active_transactions (rai::node &);
 	// Start an election for a block
 	// Call action with confirmed block, may be different than what we started with
-	bool start (MDB_txn *, std::shared_ptr<rai::block>, std::function<void(std::shared_ptr<rai::block>)> const & = [](std::shared_ptr<rai::block>) {});
+	bool start (MDB_txn *, std::shared_ptr<rai::block>, std::function<void(std::shared_ptr<rai::block>, bool)> const & = [](std::shared_ptr<rai::block>, bool) {});
 	void vote (std::shared_ptr<rai::vote>);
 	// Is the root of this block in the roots container
 	bool active (rai::block const &);
@@ -195,6 +195,7 @@ public:
 	size_t size ();
 	size_t size_sqrt ();
 	bool empty ();
+	bool hash2_aware (rai::endpoint const &);
 	std::mutex mutex;
 	rai::endpoint self;
 	boost::multi_index_container<
@@ -414,7 +415,7 @@ class node_observers
 public:
 	rai::observer_set<std::shared_ptr<rai::block>, rai::account const &, rai::amount const &> blocks;
 	rai::observer_set<bool> wallet;
-	rai::observer_set<std::shared_ptr<rai::vote>, rai::endpoint const &> vote;
+	rai::observer_set<std::shared_ptr<rai::vote>, rai::vote_code, rai::endpoint const &> vote;
 	rai::observer_set<rai::account const &, bool> account_balance;
 	rai::observer_set<rai::endpoint const &> endpoint;
 	rai::observer_set<> disconnect;
@@ -497,10 +498,12 @@ public:
 	std::pair<rai::uint128_t, rai::uint128_t> balance_pending (rai::account const &);
 	rai::uint128_t weight (rai::account const &);
 	rai::account representative (rai::account const &);
+	void store_update ();
 	void ongoing_keepalive ();
 	void ongoing_rep_crawl ();
 	void ongoing_bootstrap ();
 	void ongoing_store_flush ();
+	void v10_v11_store_update ();
 	void backup_wallet ();
 	int price (rai::uint128_t const &, int);
 	void generate_work (rai::block &);

@@ -1027,6 +1027,7 @@ void rai::rpc_handler::block_count_type ()
 	response_l.put ("receive", std::to_string (count.receive));
 	response_l.put ("open", std::to_string (count.open));
 	response_l.put ("change", std::to_string (count.change));
+	response_l.put ("hash2", std::to_string (count.hash2));
 	response (response_l);
 }
 
@@ -2412,8 +2413,9 @@ void rai::rpc_handler::process ()
 					error_response (response, "Bad signature");
 					break;
 				}
-				case rai::process_result::overspend:
+				case rai::process_result::negative_spend:
 				{
+					// TODO once we get RPC versioning, this should be changed to "negative spend"
 					error_response (response, "Overspend");
 					break;
 				}
